@@ -1,0 +1,264 @@
+#!/usr/bin/python3
+
+import sys
+from collections import namedtuple
+import subprocess
+import pathlib
+from tempfile import NamedTemporaryFile
+
+
+Command = namedtuple('Command', 'title command')
+
+
+class FatalError(Exception):
+    pass
+
+
+class Layout:
+    _id = 0
+
+    id = 0
+    parent = 'window'
+    order = 0
+    type = None
+    children = None
+
+    default_props = ['order', 'parent', 'type']
+    props = []
+
+    def serialize(self):
+        prop_dict = {}
+        for prop in (self.default_props + self.props):
+            prop_dict[prop] = getattr(self, prop)
+        return {
+            'title': self.title,
+            'props': prop_dict,
+        }
+
+    def __init__(self):
+        Layout._id += 1
+        self.id = Layout._id
+
+    @property
+    def title(self):
+        return f'{self.type.lower()}{self.id}'
+
+
+class Pane(Layout):
+    ratio = 0.5
+    props = ['ratio']
+
+    def __init__(self, children, ratio=0.5):
+        super().__init__()
+        for i, ch in enumerate(children):
+            ch.parent = self.title
+            ch.order = i
+        self.children = children
+        self.ratio = ratio
+
+
+class HPane(Pane):
+    type = 'HPaned'
+
+
+class VPane(Pane):
+    type = 'VPaned'
+
+
+class Term(Layout):
+    type = 'Terminal'
+    profile = None
+    props = ['profile']
+
+    def __init__(self, id):
+        super().__init__()
+        self.profile = f'profile{id}'
+
+
+class Terminator:
+    def __init__(self, name, commands):
+        self.profiles = []
+        self.terminals = []
+        command_count = len(commands)
+        if command_count == 0:
+            raise FatalError('No command found')
+
+        window = {
+            'title': 'window',
+            'props': {
+                'fullscreen': False,
+                'maximised': True,
+                'order': 0,
+                'parent': '',
+                'position': '0:0',
+                'title': name,
+                'type': 'Window',
+            },
+        }
+
+        try:
+            layout_root = self.get_layout(command_count)
+        except KeyError:
+            raise FatalError('Too many commands found')
+
+        children = self.create_children(layout_root)
+        self.children = [window] + [ch.serialize() for ch in children]
+
+        for i, command in enumerate(commands):
+            self.profiles.append({
+                'title': f'profile{i}',
+                'props': {
+                    'use_custom_command': True,
+                    'custom_command': self.get_full_command(command.command),
+                    'exit_action': 'restart',
+                    'scrollback_infinite': True,
+                },
+            })
+
+    def get_full_command(self, command):
+        message = 'Exited with $?. Hit enter for restart'
+        return f'{command}; printf "{message}"; read; clear'
+
+    def get_layout(self, command_count):
+        return {
+            1: Term(0),
+            2: HPane([
+                Term(0),
+                Term(1),
+            ]),
+            3: HPane([
+                Term(0),
+                VPane([
+                    Term(1),
+                    Term(2),
+                ]),
+            ]),
+            4: HPane([
+                VPane([
+                    Term(0),
+                    Term(2),
+                ]),
+                VPane([
+                    Term(1),
+                    Term(3),
+                ]),
+            ]),
+            5: VPane([
+                HPane([
+                    VPane([
+                        Term(0),
+                        Term(2),
+                    ]),
+                    VPane([
+                        Term(1),
+                        Term(3),
+                    ]),
+                ]),
+                Term(4),
+            ], ratio=0.75),
+            6: VPane([
+                HPane([
+                    VPane([
+                        Term(0),
+                        Term(2),
+                    ]),
+                    VPane([
+                        Term(1),
+                        Term(3),
+                    ]),
+                ]),
+                HPane([
+                    Term(4),
+                    Term(5),
+                ]),
+            ], ratio=0.75),
+        }[command_count]
+
+    def create_children(self, node):
+        children = [node]
+        if node.children:
+            for ch in node.children:
+                children += self.create_children(ch)
+        return children
+
+    def get_config(self):
+        return '''[global_config]
+  suppress_multiple_term_dialog = True
+[layouts]
+  [[default]]
+{children}
+[profiles]
+{profiles}'''.format(
+            children=self._serialize_entries(self.children, 3),
+            profiles=self._serialize_entries(self.profiles, 2),
+        )
+
+    @classmethod
+    def _serialize_entries(cls, entries, level=0):
+        return '\n'.join(cls._serialize_entry(e, level) for e in entries)
+
+    @classmethod
+    def _serialize_entry(cls, entry, level=0):
+        open_braces = '[' * level
+        close_braces = ']' * level
+        title = entry['title']
+        indent = ' ' * ((level - 1) * 2)
+        lines = [f'{indent}{open_braces}{title}{close_braces}']
+        for key, value in entry['props'].items():
+            indent = ' ' * (level * 2)
+            lines.append(f'{indent}{key} = {value}')
+        return '\n'.join(lines)
+
+    def run(self, config=None):
+        args = []
+        if config:
+            args += ['-g', config]
+        subprocess.check_call(['terminator'] + args)
+
+
+class RunX:
+    def __init__(self, procfile):
+        self.procfile = procfile
+        self.process = None
+
+    def read_procfile(self):
+        try:
+            with open(self.procfile) as f:
+                for line in f.readlines():
+                    title, _, command = line.partition(':')
+                    yield Command(title.strip(), command.strip())
+        except IOError:
+            raise FatalError(f'Unable to read "{self.procfile}"')
+
+    def start(self):
+        commands = list(self.read_procfile())
+        if not commands:
+            raise FatalError('No command to run')
+
+        name = pathlib.Path.cwd().name
+
+        terminator = Terminator(name, commands)
+        config = terminator.get_config()
+        with NamedTemporaryFile(mode='w+') as f:
+            f.write(config)
+            f.flush()
+            terminator.run(config=f.name)
+
+    def add_command(self, command: Command):
+        session = self.konsole.new_session()
+        session.run_command(command.command)
+        session.set_title(command.title)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        procfile = 'Procfile.dev'
+    else:
+        procfile = sys.argv[1]
+
+    runx = RunX(procfile)
+    try:
+        runx.start()
+        sys.exit(0)
+    except FatalError as e:
+        sys.exit(e.message)
